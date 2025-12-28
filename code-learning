@@ -1,0 +1,275 @@
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import numpy as np
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+from scipy.interpolate import griddata
+import os
+import seaborn as sns
+import statsmodels.api as sm
+
+# 中文显示
+import matplotlib as mpl
+
+font_path = r'C:\Windows\Fonts\simhei.ttf'
+if os.path.exists(font_path):
+    mpl.rcParams['font.family'] = 'sans-serif'
+    mpl.rcParams['font.sans-serif'] = ['SimHei']
+mpl.rcParams['axes.unicode_minus'] = False
+
+
+# --------------------  网络结构 (保持不变: 条件 2D, 输出 3D)  --------------------
+class Generator(nn.Module):
+    def __init__(self, input_size=4, condition_size=2, hidden_size=128, output_size=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_size + condition_size, hidden_size),
+            nn.BatchNorm1d(hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, output_size)
+        )
+
+    def forward(self, x, c):
+        return self.model(torch.cat([x, c], 1))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, input_size=3, condition_size=2, hidden_size=128):
+        super().__init__()
+        COND_FEAT_SIZE = 64  # 确保与模型定义兼容
+        INPUT_COMBINED_SIZE = input_size + COND_FEAT_SIZE  # 3 + 64 = 67
+
+        self.cond_layer = nn.Sequential(
+            nn.Linear(condition_size, COND_FEAT_SIZE),
+            nn.LeakyReLU(0.2)
+        )
+
+        self.model = nn.Sequential(
+            nn.Linear(INPUT_COMBINED_SIZE, hidden_size * 4), nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size * 4, hidden_size * 2), nn.LayerNorm(hidden_size * 2), nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size * 2, hidden_size), nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size, 1)
+        )
+        self.cond_pred = nn.Sequential(
+            nn.Linear(INPUT_COMBINED_SIZE, hidden_size), nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size, condition_size)
+        )
+
+    def forward(self, x, c):
+        c_feat = self.cond_layer(c)
+        comb = torch.cat([x, c_feat], 1)
+        validity = self.model(comb)
+        pred_c = self.cond_pred(comb)
+        return validity, pred_c
+
+
+# --------------------  数据 (重点修改此部分) --------------------
+class CustomDataset(Dataset):
+    def __init__(self, excel_file_path, scaler=None):
+        df = pd.read_excel(excel_file_path)
+
+        # 🟢 修正条件: 读取 Excel 第 1, 2 列 (索引 0:2) -> 2 维
+        self.conditions = df.iloc[:, 0:2].values.astype(np.float32)
+
+        # 🟢 修正标签: 读取 Excel 第 3, 4, 5 列 (索引 2:5) -> 3 维
+        self.labels = df.iloc[:, 2:5].values.astype(np.float32)
+
+        if scaler is None:
+            self.scaler = {
+                'conditions': StandardScaler().fit(self.conditions),
+                'labels': StandardScaler().fit(self.labels)
+            }
+        else:
+            self.scaler = scaler
+        self.conditions = self.scaler['conditions'].transform(self.conditions)
+        self.labels = self.scaler['labels'].transform(self.labels)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.conditions[idx]), torch.tensor(self.labels[idx])
+
+
+# --------------------  梯度惩罚 (不变) --------------------
+def compute_gradient_penalty(D, real, fake, cond):
+    alpha = torch.rand(real.size(0), 1).expand_as(real).to(real.device)
+    interp = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
+    d_interp, _ = D(interp, cond)
+    grad = torch.autograd.grad(
+        outputs=d_interp, inputs=interp,
+        grad_outputs=torch.ones_like(d_interp),
+        create_graph=True, retain_graph=True, only_inputs=True
+    )[0]
+    return ((grad.view(grad.size(0), -1).norm(2, dim=1) - 1) ** 2).mean()
+
+
+# --------------------  验证函数 (不变) --------------------
+def validate_generator(generator, loader, device, scaler):
+    generator.eval()
+    all_real, all_pred, all_cond = [], [], []
+    with torch.no_grad():
+        for cond, real in loader:
+            cond, real = cond.to(device), real.to(device)
+            noise = torch.randn(cond.size(0), 4).to(device)
+            pred = generator(noise, cond)
+            all_real.append(scaler['labels'].inverse_transform(real.cpu().numpy()))
+            all_pred.append(scaler['labels'].inverse_transform(pred.cpu().numpy()))
+            all_cond.append(scaler['conditions'].inverse_transform(cond.cpu().numpy()))
+
+    all_real = np.concatenate(all_real, 0)
+    all_pred = np.concatenate(all_pred, 0)
+    all_cond = np.concatenate(all_cond, 0)
+
+    # 逐指标计算
+    r2_each = r2_score(all_real, all_pred, multioutput='raw_values')
+    mae_each = mean_absolute_error(all_real, all_pred, multioutput='raw_values')
+    mse_each = ((all_real - all_pred) ** 2).mean(axis=0)
+    mape_each = (np.abs((all_real - all_pred) / (all_real + 1e-8))).mean(axis=0) * 100
+
+    # 整体平均
+    average_r2 = r2_score(all_real, all_pred, multioutput='uniform_average')
+    average_mae = mae_each.mean()
+    average_mse = mse_each.mean()
+
+    # 打印汇总
+    print(f"Validation MSE: {average_mse:.4f}")
+    print(f"Validation MAE: {average_mae:.4f}")
+    print(f"Validation R² (Overall): {average_r2:.4f}")
+    print("\n各特征 R²:", r2_each)
+    print("各特征 MSE:", mse_each)
+    print("各特征 MAE:", mae_each)
+    print("\n相对误差（MAPE %）:")
+    for i, err in enumerate(mape_each):
+        print(f"特征 {i + 1}: {err:.2f}%")
+
+    # ======  三维置信区间图（3 个输出）  ======
+    feature_names_zh = ['导热率', '弹性模量', '热膨胀率']
+    for i in range(3):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        unique_cond = np.unique(all_cond, axis=0)
+        for j, c in enumerate(unique_cond):
+            idx = np.all(all_cond == c, axis=1)
+            pred_vals = all_pred[idx, i]
+            mean_val = pred_vals.mean()
+            sem = pred_vals.std(ddof=1) / np.sqrt(pred_vals.size)
+            half_width = stats.t.ppf(0.975, pred_vals.size - 1) * sem
+            # 误差条
+            ax.plot([c[0], c[0]], [c[1], c[1]],
+                    [mean_val - half_width, mean_val + half_width],
+                    color='blue', alpha=0.6)
+            ax.scatter(c[0], c[1], mean_val, color='blue', s=25,
+                       label='预测均值' if j == 0 else "")
+            # 真实值
+            ax.scatter(c[0], c[1], all_real[idx, i].mean(),
+                       color='red', s=25, label='真实值' if j == 0 else "")
+
+        ax.set_xlabel('Condition 1 (Excel Col 1)')
+        ax.set_ylabel('Condition 2 (Excel Col 2)')
+        ax.set_zlabel(f'{feature_names_zh[i]} 值')
+        ax.set_title(f'{feature_names_zh[i]} 随工艺条件变化的三维置信区间')
+        ax.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
+        plt.tight_layout()
+        plt.savefig(f'3D_{feature_names_zh[i]}_置信区间_vs_条件.png', dpi=300)
+        plt.close()
+    # ======  中文修改结束  ======
+
+    # 后续图保持原样（3 个子图）
+    feature_names = ['热导率', '弹性模量', '热膨胀率']
+    plt.figure(figsize=(18, 5))
+    for i in range(3):
+        plt.subplot(1, 3, i + 1)
+        plt.scatter(all_real[:, i], all_pred[:, i], alpha=0.6, s=15)
+        mi, ma = all_real[:, i].min(), all_real[:, i].max()
+        plt.plot([mi, ma], [mi, ma], 'r--')
+        plt.xlabel('Real');
+        plt.ylabel('Predicted')
+        plt.title(f'{feature_names[i]}: Real vs Predicted')
+        plt.grid(True)
+    plt.tight_layout();
+    plt.savefig('合并_热导率_弹性模量_热膨胀率_Real_vs_Predicted.png', dpi=300);
+    plt.close()
+
+    # 热力图
+    corr = np.corrcoef(np.hstack((all_cond, all_real)).T)
+    names = [f'Cond{i + 1}' for i in range(all_cond.shape[1])] + [f'Target{i + 1}' for i in range(3)]
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(corr, annot=True, cmap='coolwarm', xticklabels=names, yticklabels=names)
+    plt.title('Correlation Matrix Heatmap')
+    plt.tight_layout();
+    plt.savefig('Correlation_Heatmap.png');
+    plt.close()
+
+    return r2_score(all_real, all_pred, multioutput='raw_values')
+
+
+# --------------------  主训练 (保持不变) --------------------
+batch_size = 128
+num_epochs = 200
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 数据
+train_set = CustomDataset(r'C:/Users/admin/Desktop/LEARNING-data.xlsx')
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+
+# 模型
+G = Generator(4, 2, 256, 3).to(device)
+D = Discriminator(3, 2, 256).to(device)
+g_opt = optim.RMSprop(G.parameters(), lr=1e-4)
+d_opt = optim.RMSprop(D.parameters(), lr=1e-4)
+g_sched = optim.lr_scheduler.ExponentialLR(g_opt, 0.98)
+d_sched = optim.lr_scheduler.ExponentialLR(d_opt, 0.98)
+
+# 训练循环
+for epoch in range(num_epochs):
+    for cond, real in train_loader:
+        cond, real = cond.to(device), real.to(device)
+        batch = cond.size(0)
+        noise = torch.randn(batch, 4).to(device)
+
+        # 判别器
+        D.zero_grad()
+        real_valid, _ = D(real, cond)
+        fake = G(noise, cond)
+        fake_valid, _ = D(fake.detach(), cond)
+        d_loss = -real_valid.mean() + fake_valid.mean() + \
+                 5 * compute_gradient_penalty(D, real, fake, cond)
+        d_loss.backward()
+        d_opt.step()
+
+        # 生成器
+        G.zero_grad()
+        fake = G(noise, cond)
+        fake_valid, _ = D(fake, cond)
+        g_loss = -fake_valid.mean() + 10 * nn.L1Loss()(fake, real)
+        g_loss.backward()
+        g_opt.step()
+
+    g_sched.step()
+    d_sched.step()
+    if epoch % 10 == 0:
+        print(f'Epoch {epoch:03d}  D-loss {d_loss.item():.4f}  G-loss {g_loss.item():.4f}')
+
+# 保存模型
+torch.save(G.state_dict(), 'generator_model.pth')
+
+# 验证
+val_set = CustomDataset(r'C:/Users/admin/Desktop/valid-FILE', scaler=train_set.scaler)
+val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+validate_generator(G, val_loader, device, train_set.scaler)
